@@ -40,7 +40,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     databaseUrl: env.DATABASE_URL ?? 'postgres://taskflow:taskflow@localhost:5432/taskflow',
     jwtSecret: effectiveSecret,
     jwtAccessTtl: env.JWT_ACCESS_TTL ?? '15m',
-    refreshTtlDays: Number(env.REFRESH_TTL_DAYS ?? 7),
+    refreshTtlDays: Number(env.REFRESH_TTL_DAYS ?? 30),
     logLevel: env.LOG_LEVEL ?? 'info',
     uploadDir: env.UPLOAD_DIR ?? './uploads',
     maxUploadMb: Number(env.MAX_UPLOAD_MB ?? 10),

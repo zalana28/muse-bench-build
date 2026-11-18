@@ -27,6 +27,7 @@ interface UserRow {
   password_hash: string;
   role: string;
   name: string;
+  token_version: number;
   created_at: string;
   updated_at: string;
   last_login_at: string | null;
@@ -100,6 +101,7 @@ interface RefreshRow {
   token_hash: string;
   expires_at: string;
   revoked_at: string | null;
+  revoked_reason: string | null;
   created_at: string;
 }
 
@@ -295,6 +297,7 @@ export async function registerUser(
     password_hash: hashPassword(input.password),
     role,
     name: input.name.trim(),
+    token_version: 0,
     created_at: now,
     updated_at: now,
     last_login_at: null,
@@ -317,10 +320,16 @@ async function issueSession(
   db: Db,
   config: Config,
   user: UserRow,
+  opts?: { expiresAt?: string },
 ): Promise<Session> {
   const accessToken = signAccessToken(user, config.jwtSecret, config.jwtAccessTtl);
   const refreshToken = newRefreshToken();
-  const expiresAt = new Date(Date.now() + config.refreshTtlDays * 24 * 60 * 60 * 1000).toISOString();
+  // Challenge D (R1): masa hidup sesi ABSOLUT 30 hari sejak login.
+  // Refresh TIDAK menggeser expiry (sliding window ditolak — token curian
+  // yang rajin di-refresh tidak boleh hidup selamanya). Pemanggil yang
+  // melanjutkan sesi (refresh) wajib meneruskan expiresAt token lama.
+  const expiresAt =
+    opts?.expiresAt ?? new Date(Date.now() + config.refreshTtlDays * 24 * 60 * 60 * 1000).toISOString();
   await db.run(
     `INSERT INTO refresh_tokens (id, user_id, token_hash, expires_at, revoked_at, created_at)
      VALUES (?, ?, ?, ?, NULL, ?)`,
@@ -355,14 +364,20 @@ export async function refreshSession(
   );
   if (!row) {
     // Reuse detection: token ini pernah dicabut -> ada yang memakai ulang
-    // token lama. Cabut SELURUH keluarga token user itu.
+    // token lama. Cabut SELURUH keluarga token user itu — TAPI hanya bila
+    // token itu dicabut karena ROTASI ('rotated'), yang menandakan token
+    // curian dipakai setelah pemilik sah me-refresh. Token yang dicabut
+    // karena logout / ganti password ('password_change') hanya 401:
+    // client basi yang mencoba refresh setelah password berubah adalah
+    // perilaku normal, dan membunuh keluarga di sini akan ikut mematikan
+    // sesi BARU yang baru diterbitkan change-password (melanggar R3).
     const revoked = await db.get<RefreshRow>(
       'SELECT * FROM refresh_tokens WHERE token_hash = ? AND revoked_at IS NOT NULL',
       [tokenHash],
     );
-    if (revoked) {
+    if (revoked && revoked.revoked_reason === 'rotated') {
       await db.run(
-        'UPDATE refresh_tokens SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL',
+        "UPDATE refresh_tokens SET revoked_at = ?, revoked_reason = 'reuse' WHERE user_id = ? AND revoked_at IS NULL",
         [nowIso(), revoked.user_id],
       );
     }
@@ -373,17 +388,68 @@ export async function refreshSession(
   }
   const user = await getUserOr404(db, row.user_id);
   // Rotasi: cabut token lama, terbitkan pasangan baru — dalam 1 transaksi.
+  // Expiry ABSOLUT dipertahankan: token baru mewarisi expires_at token
+  // lama (Challenge D, R1), bukan now + 30 hari.
   return db.transaction(async (tx) => {
-    await tx.run('UPDATE refresh_tokens SET revoked_at = ? WHERE id = ?', [nowIso(), row.id]);
-    return issueSession(tx, config, user);
+    await tx.run(
+      "UPDATE refresh_tokens SET revoked_at = ?, revoked_reason = 'rotated' WHERE id = ?",
+      [nowIso(), row.id],
+    );
+    return issueSession(tx, config, user, { expiresAt: row.expires_at });
   });
 }
 
 export async function logoutSession(db: Db, token: string): Promise<void> {
-  await db.run('UPDATE refresh_tokens SET revoked_at = ? WHERE token_hash = ? AND revoked_at IS NULL', [
-    nowIso(),
-    hashToken(token),
-  ]);
+  await db.run(
+    "UPDATE refresh_tokens SET revoked_at = ?, revoked_reason = 'logout' WHERE token_hash = ? AND revoked_at IS NULL",
+    [nowIso(), hashToken(token)],
+  );
+}
+
+/**
+ * Ganti password (Challenge D — menyelesaikan konflik R2 vs R3).
+ *
+ * 1. Password lama WAJIB benar: token curian saja tidak cukup untuk
+ *    mengganti password (kalau tidak, penyerang dengan access token
+ *    curian bisa mengunci pemilik akun keluar).
+ * 2. Dalam SATU transaksi: hash baru + token_version naik + SEMUA
+ *    refresh token dicabut + sesi BARU diterbitkan untuk peminta.
+ *    - R2 terpenuhi: tidak ada kredensial pra-perubahan yang selamat —
+ *      access token lama mati seketika (klaim `sv` tidak cocok dengan
+ *      token_version baru), refresh token lama tercabut.
+ *    - R3 terpenuhi: peminta tidak logout — respons membawa access
+ *      token + refresh token baru (route menyetel cookie baru).
+ * `revokedSessions` = jumlah refresh token aktif yang dicabut
+ * (termasuk sesi lama peminta sendiri).
+ */
+export async function changePassword(
+  db: Db,
+  config: Config,
+  userId: string,
+  input: { currentPassword: string; newPassword: string },
+): Promise<{ session: Session; revokedSessions: number }> {
+  const user = await getUserOr404(db, userId);
+  if (!verifyPassword(input.currentPassword, user.password_hash)) {
+    throw unauthorized('Password lama salah');
+  }
+  if (input.newPassword === input.currentPassword) {
+    throw badRequest('Password baru harus berbeda dari password lama');
+  }
+  const newHash = hashPassword(input.newPassword);
+  const newVersion = (user.token_version ?? 0) + 1;
+  const updatedUser: UserRow = { ...user, password_hash: newHash, token_version: newVersion };
+  return db.transaction(async (tx) => {
+    await tx.run(
+      'UPDATE users SET password_hash = ?, token_version = ?, updated_at = ? WHERE id = ?',
+      [newHash, newVersion, nowIso(), user.id],
+    );
+    const revoked = await tx.run(
+      "UPDATE refresh_tokens SET revoked_at = ?, revoked_reason = 'password_change' WHERE user_id = ? AND revoked_at IS NULL",
+      [nowIso(), user.id],
+    );
+    const session = await issueSession(tx, config, updatedUser);
+    return { session, revokedSessions: revoked.changes };
+  });
 }
 
 /* ------------------------------------------------------------------ */

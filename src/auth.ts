@@ -20,15 +20,17 @@ export interface AccessTokenPayload {
   sub: string;
   email: string;
   role: string;
+  /** Versi sesi (Challenge D): sama dengan users.token_version saat token diterbitkan. */
+  sv: number;
 }
 
 export function signAccessToken(
-  user: { id: string; email: string; role: string },
+  user: { id: string; email: string; role: string; token_version: number },
   secret: string,
   ttl: string,
 ): string {
   return jwt.sign(
-    { sub: user.id, email: user.email, role: user.role } satisfies AccessTokenPayload,
+    { sub: user.id, email: user.email, role: user.role, sv: user.token_version } satisfies AccessTokenPayload,
     secret,
     { expiresIn: ttl } as jwt.SignOptions,
   );

@@ -13,6 +13,7 @@ import {
 } from './middleware';
 import * as svc from './services';
 import {
+  changePasswordSchema,
   commentSchema,
   labelSchema,
   loginSchema,
@@ -60,7 +61,7 @@ function requireUser(req: Request): { id: string; email: string; role: string } 
 
 export function createRouter(db: Db, config: Config): Router {
   const r = Router();
-  const auth = requireAuth(config);
+  const auth = requireAuth(db, config);
   const authLimiter = authRateLimit(config);
 
   /* ---------------- Auth ---------------- */
@@ -101,6 +102,26 @@ export function createRouter(db: Db, config: Config): Router {
       if (token) await svc.logoutSession(db, token);
       setRefreshCookie(res, config, null);
       res.status(204).send();
+    }),
+  );
+  r.post(
+    '/auth/change-password',
+    auth,
+    authLimiter,
+    validateBody(changePasswordSchema),
+    asyncHandler(async (req, res) => {
+      // Challenge D: cabut SEMUA sesi (R2), lalu terbitkan sesi baru
+      // untuk peminta dalam respons yang sama (R3) — peminta tidak logout.
+      const { session, revokedSessions } = await svc.changePassword(
+        db,
+        config,
+        requireUser(req).id,
+        req.body as { currentPassword: string; newPassword: string },
+      );
+      setRefreshCookie(res, config, session.refreshToken);
+      res.json({
+        data: { user: session.user, accessToken: session.accessToken, revokedSessions },
+      });
     }),
   );
 

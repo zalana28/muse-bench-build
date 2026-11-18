@@ -13,6 +13,12 @@ export const loginSchema = z.object({
   password: z.string().min(1, 'Password wajib diisi'),
 });
 
+/** Ganti password (Challenge D): password baru mengikuti aturan register. */
+export const changePasswordSchema = z.object({
+  currentPassword: z.string().min(1, 'Password lama wajib diisi'),
+  newPassword: z.string().min(8, 'Password minimal 8 karakter').max(128),
+});
+
 export const workspaceSchema = z.object({
   name: z.string().trim().min(1, 'Nama workspace wajib diisi').max(100),
 });

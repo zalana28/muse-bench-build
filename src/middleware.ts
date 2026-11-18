@@ -4,6 +4,7 @@ import rateLimit from 'express-rate-limit';
 import type { z } from 'zod';
 import { verifyAccessToken } from './auth';
 import type { Config } from './config';
+import type { Db } from './db';
 import { AppError, unauthorized } from './errors';
 
 export interface AuthUser {
@@ -29,18 +30,41 @@ export function requestId(_req: Request, res: Response, next: NextFunction): voi
 }
 
 /** Membaca `Authorization: Bearer <jwt>`; gagal -> 401. */
-export function requireAuth(config: Config) {
+/** Auth JWT + cek versi sesi (Challenge D).
+ *
+ * Selain memverifikasi signature & expiry, middleware memeriksa klaim
+ * `sv` token terhadap `users.token_version` di DB. Token yang diterbitkan
+ * SEBELUM password terakhir diubah langsung ditolak (401) — tanpa
+ * menunggu masa 15 menitnya habis. Ini yang membuat R2 ("semua sesi
+ * invalidate saat password berubah") benar-benar berlaku untuk access
+ * token stateless, bukan hanya refresh token.
+ *
+ * Biaya: 1 lookup PK per request terautentikasi (better-sqlite3, <0,1 ms
+ * pada skala sandbox) — dibayar demi invalidasi instan. Token lama yang
+ * dibuat sebelum klaim `sv` ada (sv = undefined) juga ditolak: deploy
+ * perubahan ini menginvalidasi semua sesi lama satu kali, by design.
+ */
+export function requireAuth(db: Db, config: Config) {
   return (req: Request, _res: Response, next: NextFunction): void => {
     const header = req.headers.authorization ?? '';
     const match = /^Bearer\s+(.+)$/.exec(header);
     if (!match) return next(unauthorized('Header Authorization Bearer wajib ada'));
+    let payload;
     try {
-      const payload = verifyAccessToken(match[1], config.jwtSecret);
-      req.user = { id: payload.sub, email: payload.email, role: payload.role };
-      return next();
+      payload = verifyAccessToken(match[1], config.jwtSecret);
     } catch {
       return next(unauthorized());
     }
+    req.user = { id: payload.sub, email: payload.email, role: payload.role };
+    db.get<{ token_version: number }>('SELECT token_version FROM users WHERE id = ?', [payload.sub])
+      .then((row) => {
+        if (!row) return next(unauthorized());
+        if (payload.sv !== row.token_version) {
+          return next(unauthorized('Sesi sudah tidak berlaku — silakan login kembali'));
+        }
+        return next();
+      })
+      .catch(() => next(unauthorized()));
   };
 }
 

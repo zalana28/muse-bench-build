@@ -40,6 +40,10 @@ CREATE TABLE IF NOT EXISTS users (
   password_hash TEXT NOT NULL,
   role TEXT NOT NULL DEFAULT 'user' CHECK (role IN ('admin', 'user')),
   name TEXT NOT NULL,
+  -- Versi sesi (Challenge D): naik setiap kali password berubah.
+  -- Access token membawa klaim 'sv'; middleware menolak token yang
+  -- diterbitkan sebelum perubahan password terakhir.
+  token_version INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   last_login_at TEXT
@@ -158,6 +162,12 @@ CREATE TABLE IF NOT EXISTS refresh_tokens (
   token_hash TEXT NOT NULL,
   expires_at TEXT NOT NULL,
   revoked_at TEXT,
+  -- Alasan pencabutan (Challenge D): 'rotated' | 'logout' |
+  -- 'password_change' | 'reuse'. Reuse-detection hanya bereaksi pada
+  -- token yang dicabut karena ROTASI (tanda pencurian); token yang
+  -- dicabut karena logout/ganti password hanya 401 tanpa membunuh
+  -- keluarga token (lihat refreshSession).
+  revoked_reason TEXT,
   created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_refresh_user
@@ -318,4 +328,20 @@ export async function createDb(config: Config): Promise<Db> {
 
 export async function initSchema(db: Db): Promise<void> {
   await db.exec(SCHEMA_SQL);
+  // Migrasi ringan (Challenge D): DB yang dibuat sebelum kolom
+  // token_version ada tidak mendapatkannya dari CREATE TABLE IF NOT EXISTS.
+  // Idempotent: abaikan error "kolom sudah ada" di kedua driver
+  // (SQLite: "duplicate column name", Postgres: "already exists").
+  try {
+    await db.exec('ALTER TABLE users ADD COLUMN token_version INTEGER NOT NULL DEFAULT 0');
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : '';
+    if (!/already exists|duplicate column/i.test(msg)) throw err;
+  }
+  try {
+    await db.exec('ALTER TABLE refresh_tokens ADD COLUMN revoked_reason TEXT');
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : '';
+    if (!/already exists|duplicate column/i.test(msg)) throw err;
+  }
 }

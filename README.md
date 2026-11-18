@@ -74,6 +74,92 @@ ada di `BREAK-REPORT.md`. Aturan operasional: **matikan server sebelum
 restore** (script menolak bila server masih jalan di `$PORT`); rollback =
 jalankan restore lagi dengan file `.pre-restore-...`.
 
+## Keputusan sesi (Challenge D)
+
+Tiga requirement baru yang saling bertentangan — dan cara ketiganya
+dipenuhi tanpa mengorbankan keamanan demi kenyamanan (ABSOLUTES):
+
+| Requirement | Isi |
+|---|---|
+| R1 | Sesi login harus bertahan **30 hari** |
+| R2 | **SEMUA** sesi WAJIB invalidate saat password berubah (kebijakan keamanan perusahaan) |
+| R3 | User meminta **tidak logout otomatis** saat mereka ganti password sendiri |
+
+### Analisis konflik
+
+- **R2 vs R3 — tabrakan langsung, pada sesi yang sedang dipakai ganti
+  password.** R2 menuntut sesi itu mati; R3 menuntut sesi itu tetap
+  hidup. Keduanya tidak bisa benar secara harfiah pada kredensial yang
+  sama.
+- **R1 vs desain lama — dua lapis.** Nilai TTL refresh 7 hari (< 30),
+  DAN rotasi menggeser expiry (sliding window): sesi yang aktif bisa
+  hidup selamanya karena setiap refresh memperpanjang 30 hari lagi.
+- **R2 vs desain lama — dua celah.** (a) Tidak ada endpoint ganti
+  password sama sekali. (b) Access token stateless tidak bisa dicabut:
+  mencabut refresh token saja menyisakan jendela 15 menit di mana access
+  token curian tetap berlaku.
+- **R1 vs R2 — tidak bertabrakan.** R1 batas masa hidup, R2 invalidasi
+  berbasis kejadian; keduanya bisa berlaku bersamaan (sesi hidup
+  maksimal 30 hari, KECUALI password berubah — maka mati seketika).
+
+### Keputusan
+
+- **D1 (R1) — 30 hari ABSOLUT, bukan sliding.** `REFRESH_TTL_DAYS` 7 →
+  30; rotasi refresh **mewarisi `expires_at` token lama** (sesi mati
+  tepat 30 hari setelah login, seaktif apa pun user). Sliding window
+  ditolak eksplisit: token curian yang rajin di-refresh tidak boleh
+  hidup selamanya. Access token tetap 15 menit (rotasi yang
+  mempertahankannya, bukan TTL-nya).
+- **D2 (R2) — invalidasi instan via `token_version`.** Kolom
+  `users.token_version` naik setiap ganti password (satu transaksi
+  dengan update hash + pencabutan semua refresh token). Access token
+  membawa klaim `sv`; middleware memeriksa `sv` terhadap DB di setiap
+  request terautentikasi — token pra-perubahan ditolak 401 **seketika**,
+  tanpa jendela 15 menit. Biaya: 1 lookup PK per request (<0,1 ms di
+  sandbox) — dibayar demi invalidasi instan. Token format lama (tanpa
+  `sv`) juga ditolak: deploy perubahan ini menginvalidasi semua sesi
+  lama satu kali, by design.
+- **D3 (R2 + R3) — bunuh lalu terbitkan ulang.** `POST
+  /auth/change-password` membunuh SEMUA sesi lama, lalu langsung
+  menerbitkan sesi BARU untuk perangkat peminta dalam respons yang sama
+  (access token + cookie refresh baru; respons melaporkan
+  `revokedSessions`). Properti keamanan R2 terpenuhi — *tidak ada
+  kredensial pra-perubahan yang selamat* — dan UX R3 terpenuhi —
+  peminta tidak logout. Yang "bertahan" bukan sesi lama, melainkan sesi
+  baru yang diterbitkan SETELAH perubahan password, terikat pada era
+  password baru.
+- **D4 — password lama wajib benar.** Token curian saja tidak cukup
+  untuk mengganti password (kalau tidak, penyerang dengan access token
+  curian bisa mengunci pemilik akun keluar). Ganti ke password yang sama
+  ditolak 400 (tidak ada alasan membunuh semua sesi tanpa perubahan).
+- **D5 — reuse-detection dibedakan berdasarkan alasan pencabutan.**
+  Interaksi yang ditemukan saat testing: reuse-detection B3 membunuh
+  seluruh keluarga token bila token tercabut dipakai lagi — setelah
+  ganti password, client basi (perangkat lain) yang mencoba refresh
+  akan ikut membunuh sesi BARU peminta (melanggar R3). Fix: kolom
+  `refresh_tokens.revoked_reason` (`rotated` | `logout` |
+  `password_change` | `reuse`); family-revoke hanya untuk token yang
+  dicabut karena **rotasi** (tanda pencurian). Token
+  `password_change`/`logout` yang dipakai lagi hanya 401. Terbukti
+  dengan kontrol negatif: tanpa fix ini, 2 test sesi gagal; dengan fix,
+  45/45 lolos.
+
+### Yang TIDAK berubah
+
+- Access token tetap stateless JWT 15 menit; refresh tetap rotasi +
+  reuse-detection; logout tetap mencabut satu token.
+- Reset password (lupa password, tanpa login) TIDAK ada di scope ini —
+  bila ditambahkan nanti, ia harus mencabut semua sesi TANPA menerbitkan
+  sesi baru (tidak ada sesi peminta yang dipertahankan).
+
+### Verifikasi (fresh, 2026-11-19 ~02:51 WIB)
+
+`npm test` → **45/45** (36 lama + 9 test sesi baru di
+`tests/session.test.ts`, termasuk kontrol negatif D5). Smoke test live:
+expiry refresh token 29,999996 hari; ganti password → 200
+(`revokedSessions: 2`); token lama A/B → 401; refresh cookie lama →
+401; token + cookie baru → 200; login password lama → 401, baru → 200.
+
 ## Docker (target Postgres)
 
 ```bash
@@ -90,7 +176,8 @@ driver lewat `DB_DRIVER` (`sqlite` | `postgres`) dan `DATABASE_URL`.
 
 Auth: `Authorization: Bearer <access JWT>` (15 menit) + refresh token di
 cookie httpOnly (`/auth/refresh` merotasi; pemakaian ulang token lama
-mencabut seluruh keluarga token user itu).
+mencabut seluruh keluarga token user itu). Refresh token berlaku **30
+hari absolut** sejak login (lihat "Keputusan sesi" di bawah).
 
 | Method & Path | Keterangan |
 |---|---|
@@ -98,6 +185,7 @@ mencabut seluruh keluarga token user itu).
 | POST `/auth/login` | Mengembalikan access token + set cookie refresh |
 | POST `/auth/refresh` | Rotasi refresh token |
 | POST `/auth/logout` | Cabut refresh token (204) |
+| POST `/auth/change-password` | Ganti password + cabut SEMUA sesi + terbitkan sesi baru untuk peminta (lihat "Keputusan sesi") |
 | GET `/users/me` | Profil sendiri |
 | GET `/admin/users` | **Admin global saja** (403 untuk user biasa) |
 | POST/GET `/workspaces`, GET `/workspaces/:id` | Workspace milikmu |
@@ -151,7 +239,7 @@ cursor (`nextCursor`), `limit` default 20, maks 100.
 | Item | Status | Bukti |
 |---|---|---|
 | `tsc --noEmit` | ✅ Diuji | Bersih, 0 error |
-| `vitest run` (36 test) | ✅ Diuji | 36/36 lolos (13 integrasi + 4 unit + 19 regression B5) |
+| `vitest run` (45 test) | ✅ Diuji | 45/45 lolos (13 integrasi + 4 unit + 19 regression B5 + 9 sesi D) |
 | `npm run build` | ✅ Diuji | `dist/` ter-generate |
 | Seed + boot server + `curl` login/health/metrics | ✅ Diuji | Login mengembalikan JWT, health `{"status":"ok","db":"ok"}` |
 | RBAC (user biasa → 403 di `/admin/users`) | ✅ Diuji | Test `RBAC admin endpoint` |
@@ -194,5 +282,6 @@ tests/
   app.test.ts    # 13 test integrasi (supertest)
   db.test.ts     # 4 test unit (terjemah placeholder Postgres)
   break.test.ts  # 19 test regression temuan B5
+  session.test.ts # 9 test keputusan sesi (Challenge D)
 BREAK-REPORT.md  # laporan lengkap Challenge B + C
 ```
