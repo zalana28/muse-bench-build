@@ -11,6 +11,11 @@ import {
 import type { Config } from './config';
 import type { Db } from './db';
 import { badRequest, conflict, forbidden, notFound, unauthorized } from './errors';
+import {
+  TASK_CREATE_ENDPOINT,
+  findClaim,
+  hashRequest,
+} from './idempotency';
 
 /* ------------------------------------------------------------------ */
 /* Types baris DB (snake_case) -> publik (camelCase)                   */
@@ -677,6 +682,11 @@ export async function createTask(
     dueDate?: string | null;
     labelIds?: string[];
   },
+  opts?: {
+    /** Bila diisi, klaim idempotency ditulis + diselesaikan dalam transaksi
+     *  yang sama dengan pembuatan task (atomic — temuan B5-F4/F5). */
+    idempotency?: { key: string; endpoint: string; requestHash: string };
+  },
 ) {
   const project = await getProjectOr404(db, projectId);
   await requireMembership(db, project.workspace_id, userId, 'member');
@@ -707,6 +717,17 @@ export async function createTask(
     updated_at: now,
   };
   await db.transaction(async (tx) => {
+    if (opts?.idempotency) {
+      // Klaim dulu: PK (user_id, endpoint, idem_key) membuat dua percobaan
+      // dengan kunci yang sama tidak bisa sama-sama lolos — yang kedua
+      // gagal di sini dan transaksinya di-rollback seluruhnya.
+      await tx.run(
+        `INSERT INTO idempotency_keys
+           (user_id, endpoint, idem_key, request_hash, response_status, response_body, created_at)
+         VALUES (?, ?, ?, ?, NULL, NULL, ?)`,
+        [userId, opts.idempotency.endpoint, opts.idempotency.key, opts.idempotency.requestHash, now],
+      );
+    }
     await tx.run(
       `INSERT INTO tasks
          (id, project_id, title, description, status, priority, assignee_id, reporter_id,
@@ -728,8 +749,101 @@ export async function createTask(
       action: 'created',
       payload: { title: task.title },
     });
+    if (opts?.idempotency) {
+      // Selesaikan klaim dengan respons yang akan dikembalikan ke client.
+      await tx.run(
+        `UPDATE idempotency_keys SET response_status = ?, response_body = ?
+          WHERE user_id = ? AND endpoint = ? AND idem_key = ?`,
+        [
+          201,
+          JSON.stringify({ data: toTask(task) }),
+          userId,
+          opts.idempotency.endpoint,
+          opts.idempotency.key,
+        ],
+      );
+    }
   });
   return toTask(task);
+}
+
+/** Mutex in-process per kunci: request paralel dengan kunci yang sama
+ *  diserialisasi — yang datang belakangan menunggu leader selesai lalu
+ *  me-replay respons tersimpan. (Tabel klaim menangani retry sekuensial
+ *  dan restart; mutex menangani race paralel dalam satu proses.) */
+const idempotencyLocks = new Map<string, Promise<unknown>>();
+
+export interface IdempotentResult {
+  status: number;
+  body: unknown;
+  replayed: boolean;
+}
+
+/**
+ * Pembuatan task dengan dukungan Idempotency-Key (temuan B5-F4/F5).
+ * Tanpa kunci -> perilaku lama. Dengan kunci:
+ * - kunci + payload sama (paralel, sekuensial, atau setelah restart)
+ *   -> respons tersimpan, task TIDAK dibuat lagi;
+ * - kunci sama + payload berbeda -> 409.
+ */
+export async function createTaskIdempotent(
+  db: Db,
+  userId: string,
+  projectId: string,
+  input: Parameters<typeof createTask>[3],
+  key: string,
+): Promise<IdempotentResult> {
+  const endpoint = TASK_CREATE_ENDPOINT;
+  const requestHash = hashRequest({ projectId, input });
+  const replay = async (): Promise<IdempotentResult | null> => {
+    const claim = await findClaim(db, userId, endpoint, key);
+    if (!claim || claim.response_status === null || claim.response_body === null) return null;
+    if (claim.request_hash !== requestHash) {
+      throw conflict('Idempotency-Key sudah dipakai dengan payload berbeda');
+    }
+    return {
+      status: claim.response_status,
+      body: JSON.parse(claim.response_body) as unknown,
+      replayed: true,
+    };
+  };
+  const done = await replay();
+  if (done) return done;
+  const lockKey = `${userId}|${endpoint}|${key}`;
+  const inFlight = idempotencyLocks.get(lockKey);
+  if (inFlight) {
+    try {
+      await inFlight;
+    } catch {
+      /* Leader gagal sebelum menulis klaim; coba jadi leader baru. */
+    }
+    const after = await replay();
+    if (after) return after;
+  }
+  const run = (async (): Promise<IdempotentResult> => {
+    try {
+      const task = await createTask(db, userId, projectId, input, {
+        idempotency: { key, endpoint, requestHash },
+      });
+      return { status: 201, body: { data: task }, replayed: false };
+    } catch (err) {
+      // Race yang lolos dari mutex (mis. dua proses): klaim sudah ada.
+      if (
+        err instanceof Error &&
+        /UNIQUE constraint failed: idempotency_keys/.test(err.message)
+      ) {
+        const raced = await replay();
+        if (raced) return raced;
+      }
+      throw err;
+    }
+  })();
+  idempotencyLocks.set(lockKey, run);
+  try {
+    return await run;
+  } finally {
+    idempotencyLocks.delete(lockKey);
+  }
 }
 
 export async function listTasks(db: Db, userId: string, projectId: string, filters: TaskFilters) {

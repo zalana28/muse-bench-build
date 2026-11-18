@@ -1,5 +1,6 @@
 import cors from 'cors';
 import express, { type Express } from 'express';
+import fs from 'node:fs';
 import helmet from 'helmet';
 import pino from 'pino';
 import type { Config } from './config';
@@ -30,9 +31,20 @@ export function createApp(db: Db, config: Config): { app: Express; metrics: AppM
     next();
   });
 
+  // Health check yang benar-benar memeriksa DB (temuan B5-F8): versi lama
+  // hanya `SELECT 1` pada koneksi yang sudah terbuka, sehingga file DB yang
+  // di-rename/dihapus saat server jalan tetap dilaporkan "ok" — padahal
+  // tulisannya masuk ke inode yang sudah tidak punya nama (data hilang
+  // diam-diam saat restart). Sekarang: file harus ada di path yang
+  // dikonfigurasi, dan query menyentuh tabel nyata.
   app.get('/health', async (_req, res) => {
     try {
-      await db.get('SELECT 1 AS ok');
+      if (config.dbDriver === 'sqlite' && config.sqlitePath !== ':memory:') {
+        if (!fs.existsSync(config.sqlitePath)) {
+          throw new Error(`file database tidak ada di ${config.sqlitePath}`);
+        }
+      }
+      await db.get('SELECT COUNT(*) AS n FROM users');
       res.json({ status: 'ok', db: 'ok' });
     } catch {
       res.status(503).json({ status: 'error', db: 'down' });
@@ -55,6 +67,29 @@ export function createApp(db: Db, config: Config): { app: Express; metrics: AppM
         `taskflow_uptime_seconds ${uptimeSec}`,
       ].join('\n') + '\n',
     );
+  });
+
+  // Fail-closed bila file DB hilang saat server jalan (temuan B5-F8):
+  // tanpa ini, write tetap mengembalikan 201 padahal tulisannya masuk ke
+  // inode yang sudah tidak punya nama — data hilang diam-diam saat
+  // restart. Sekarang semua request API gagal keras 503 begitu file
+  // tidak ada, sampai operator memulihkan dari backup. (Tidak berlaku
+  // untuk :memory: dan Postgres — tidak ada file yang bisa hilang.)
+  app.use('/api/v1', (_req, res, next) => {
+    if (
+      config.dbDriver === 'sqlite' &&
+      config.sqlitePath !== ':memory:' &&
+      !fs.existsSync(config.sqlitePath)
+    ) {
+      res.status(503).json({
+        error: {
+          code: 'DB_UNAVAILABLE',
+          message: `File database tidak ada di ${config.sqlitePath} — data tidak bisa disimpan. Pulihkan dari backup (npm run restore -- <file-backup>).`,
+        },
+      });
+      return;
+    }
+    next();
   });
 
   app.use('/api/v1', createRouter(db, config));

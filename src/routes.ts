@@ -1,7 +1,8 @@
 import { Router, type Request, type Response } from 'express';
 import type { Config } from './config';
 import type { Db } from './db';
-import { notFound } from './errors';
+import { unauthorized } from './errors';
+import { readIdempotencyKey } from './idempotency';
 import {
   asyncHandler,
   authRateLimit,
@@ -86,7 +87,8 @@ export function createRouter(db: Db, config: Config): Router {
     '/auth/refresh',
     asyncHandler(async (req, res) => {
       const token = readRefreshCookie(req);
-      if (!token) throw notFound('Refresh token');
+      // Cookie hilang = sesi tidak ada -> 401, bukan 404 (temuan B5-F6).
+      if (!token) throw unauthorized('Refresh token wajib ada');
       const session = await svc.refreshSession(db, config, token);
       setRefreshCookie(res, config, session.refreshToken);
       res.json({ data: { user: session.user, accessToken: session.accessToken } });
@@ -270,13 +272,28 @@ export function createRouter(db: Db, config: Config): Router {
     auth,
     validateBody(taskCreateSchema),
     asyncHandler(async (req, res) => {
-      const task = await svc.createTask(
+      const userId = requireUser(req).id;
+      const key = readIdempotencyKey(req);
+      if (!key) {
+        const task = await svc.createTask(
+          db,
+          userId,
+          req.params.projectId,
+          req.body as Parameters<typeof svc.createTask>[3],
+        );
+        res.status(201).json({ data: task });
+        return;
+      }
+      // Dengan Idempotency-Key: retry (paralel / sekuensial / restart)
+      // mengembalikan respons tersimpan tanpa membuat duplikat (B5-F4/F5).
+      const result = await svc.createTaskIdempotent(
         db,
-        requireUser(req).id,
+        userId,
         req.params.projectId,
         req.body as Parameters<typeof svc.createTask>[3],
+        key,
       );
-      res.status(201).json({ data: task });
+      res.status(result.status).json(result.body);
     }),
   );
   r.get(

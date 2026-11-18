@@ -118,6 +118,22 @@ export function errorHandler(
     });
     return;
   }
+  // body-parser (express.json) melempar error dengan `type`, bukan AppError.
+  // Tanpa pemetaan ini, JSON rusak / body > limit jadi 500 — padahal itu
+  // kesalahan client (temuan B5-F2/F3: harus 400 / 413).
+  if (err instanceof Error) {
+    const type = (err as { type?: string }).type;
+    if (type === 'entity.parse.failed') {
+      res.status(400).json({ error: { code: 'BAD_REQUEST', message: 'Body JSON tidak valid' } });
+      return;
+    }
+    if (type === 'entity.too.large') {
+      res.status(413).json({
+        error: { code: 'PAYLOAD_TOO_LARGE', message: 'Body terlalu besar (maks 1 MB)' },
+      });
+      return;
+    }
+  }
   // eslint-disable-next-line no-console
   console.error(`[${req.requestId ?? '-'}] unexpected error:`, err);
   res.status(500).json({ error: { code: 'INTERNAL_ERROR', message: 'Terjadi kesalahan server' } });

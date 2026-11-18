@@ -134,3 +134,15 @@ CREATE TABLE IF NOT EXISTS refresh_tokens (
 );
 CREATE INDEX IF NOT EXISTS idx_refresh_user
   ON refresh_tokens(user_id) WHERE revoked_at IS NULL;
+
+-- Idempotency keys (temuan B5-F4/F5; lihat juga SCHEMA_SQL di src/db.ts).
+CREATE TABLE IF NOT EXISTS idempotency_keys (
+  user_id UUID NOT NULL,
+  endpoint TEXT NOT NULL,
+  idem_key TEXT NOT NULL,
+  request_hash TEXT NOT NULL,
+  response_status INTEGER,
+  response_body TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (user_id, endpoint, idem_key)
+);

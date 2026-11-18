@@ -162,6 +162,22 @@ CREATE TABLE IF NOT EXISTS refresh_tokens (
 );
 CREATE INDEX IF NOT EXISTS idx_refresh_user
   ON refresh_tokens(user_id) WHERE revoked_at IS NULL;
+
+-- Idempotency keys (temuan B5-F4/F5): satu kunci + satu user + satu
+-- endpoint hanya boleh menghasilkan satu efek. response_status/body
+-- NULL saat klaim dibuat (di dalam transaksi yang sama dengan pembuatan
+-- task) dan diisi begitu task berhasil dibuat; retry dengan kunci yang
+-- sama mengembalikan respons tersimpan tanpa membuat duplikat.
+CREATE TABLE IF NOT EXISTS idempotency_keys (
+  user_id TEXT NOT NULL,
+  endpoint TEXT NOT NULL,
+  idem_key TEXT NOT NULL,
+  request_hash TEXT NOT NULL,
+  response_status INTEGER,
+  response_body TEXT,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (user_id, endpoint, idem_key)
+);
 `;
 
 class SqliteDb implements Db {
@@ -171,6 +187,11 @@ class SqliteDb implements Db {
     this.db = db;
     this.db.pragma('foreign_keys = ON');
     this.db.pragma('journal_mode = WAL');
+  }
+
+  /** PRAGMA integrity_check: 'ok' bila file sehat. Dipanggil createDb saat boot. */
+  pragmaIntegrityCheck(): string {
+    return this.db.pragma('integrity_check', { simple: true }) as string;
   }
 
   async get<T>(sql: string, params: unknown[] = []): Promise<T | undefined> {
@@ -269,7 +290,30 @@ export async function createDb(config: Config): Promise<Db> {
   // vitest, tsc, dan clone-run semuanya jalan tanpa trik import.
   // better-sqlite3 TIDAK membuat folder parent file DB — buat dulu.
   fs.mkdirSync(path.dirname(config.sqlitePath), { recursive: true });
-  return new SqliteDb(new Database(config.sqlitePath));
+  let sqlite: SqliteDb;
+  try {
+    sqlite = new SqliteDb(new Database(config.sqlitePath));
+  } catch (err) {
+    // File ada tapi bukan SQLite (korup / tertimpa file lain): gagal start
+    // dengan pesan yang bisa ditindaklanjuti, bukan stack mentah
+    // (temuan B5-F9; bukti: 'fatal startup error: SqliteError: file is not
+    // a database' tanpa petunjuk recovery).
+    throw new Error(
+      `Database di ${config.sqlitePath} korup atau bukan file SQLite. ` +
+        `Pulihkan dari backup: npm run restore -- <file-backup> (lihat BREAK-REPORT.md). ` +
+        `Detail: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+  // Integrity check saat boot (temuan B5-F8): bedakan "DB baru yang kosong"
+  // dari "DB yang rusak". PRAGMA ini cepat untuk ukuran DB ini.
+  const check = sqlite.pragmaIntegrityCheck();
+  if (check !== 'ok') {
+    throw new Error(
+      `Database di ${config.sqlitePath} gagal integrity check (${check}). ` +
+        `Pulihkan dari backup: npm run restore -- <file-backup> (lihat BREAK-REPORT.md).`,
+    );
+  }
+  return sqlite;
 }
 
 export async function initSchema(db: Db): Promise<void> {
